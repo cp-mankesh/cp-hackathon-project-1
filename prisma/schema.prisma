@@ -1,0 +1,199 @@
+// Call Intelligence Platform — tenants, auth, calls, analysis (per PLAN.md)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// --- Auth & tenancy ---
+
+model Organisation {
+  id        String   @id @default(cuid())
+  name      String
+  slug      String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  users User[]
+  roles Role[]
+  calls Call[]
+}
+
+/// Role per org; permissions JSON: { "users": { "c": true, "r": true, "u": true, "d": false }, ... }
+model Role {
+  id             String   @id @default(cuid())
+  name           String
+  organisationId String
+  organisation   Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  permissions    Json     @default("{}")
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  users User[]
+
+  @@unique([organisationId, name])
+}
+
+model User {
+  id               String   @id @default(cuid())
+  email            String   @unique
+  passwordHash     String
+  name             String?
+  organisationId   String
+  organisation     Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  roleId           String
+  assignedRole     Role     @relation(fields: [roleId], references: [id], onDelete: Restrict)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  sessions     Session[]
+  uploadedCalls Call[]   @relation("CallUploader")
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  token     String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+}
+
+// --- Calls & analysis pipeline ---
+
+enum CallProcessingStatus {
+  QUEUED
+  TRANSCRIBING
+  ANALYZING
+  COMPLETED
+  FAILED
+  PARTIAL
+}
+
+enum AnalysisJobStatus {
+  PENDING
+  QUEUED
+  TRANSCRIBING
+  ANALYZING
+  COMPLETED
+  FAILED
+  PARTIAL
+}
+
+enum AnalysisBatchStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+enum SentimentLabel {
+  POSITIVE
+  NEUTRAL
+  NEGATIVE
+}
+
+/// One sales call recording + metadata (org-scoped).
+model Call {
+  id               String               @id @default(cuid())
+  organisationId   String
+  organisation     Organisation         @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  uploadedById     String
+  uploadedBy       User                 @relation("CallUploader", fields: [uploadedById], references: [id], onDelete: Restrict)
+  title            String?
+  originalFileName String
+  audioStorageKey  String
+  mimeType         String
+  sizeBytes        Int
+  durationSec      Int?
+  status           CallProcessingStatus @default(QUEUED)
+  createdAt        DateTime             @default(now())
+  updatedAt        DateTime             @updatedAt
+
+  transcript  Transcript?
+  analysisJob AnalysisJob?
+  insight     CallInsight?
+
+  @@index([organisationId, status])
+  @@index([organisationId, createdAt])
+}
+
+model Transcript {
+  id        String   @id @default(cuid())
+  callId    String   @unique
+  call      Call     @relation(fields: [callId], references: [id], onDelete: Cascade)
+  fullText  String   @db.Text
+  /// Optional diarized segments: [{ "start": number, "end": number, "text": string, "speaker"?: "agent"|"customer" }]
+  segments  Json?
+  createdAt DateTime @default(now())
+}
+
+model AnalysisJob {
+  id          String            @id @default(cuid())
+  callId      String            @unique
+  call        Call              @relation(fields: [callId], references: [id], onDelete: Cascade)
+  status      AnalysisJobStatus @default(PENDING)
+  lastError   String?           @db.Text
+  startedAt   DateTime?
+  completedAt DateTime?
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+
+  batches AnalysisBatch[]
+}
+
+model AnalysisBatch {
+  id           String              @id @default(cuid())
+  jobId        String
+  job          AnalysisJob         @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  batchIndex   Int
+  status       AnalysisBatchStatus @default(PENDING)
+  retryCount   Int                 @default(0)
+  errorMessage String?             @db.Text
+  createdAt    DateTime            @default(now())
+  updatedAt    DateTime            @updatedAt
+
+  @@unique([jobId, batchIndex])
+  @@index([jobId])
+}
+
+/// Normalised AI output for dashboards & per-call UI (PLAN §4–5).
+model CallInsight {
+  id        String @id @default(cuid())
+  callId    String @unique
+  call      Call   @relation(fields: [callId], references: [id], onDelete: Cascade)
+
+  summary   String @db.Text
+  sentiment SentimentLabel
+
+  overallScore      Float
+  agentTalkPct      Float
+  customerTalkPct   Float
+
+  /// Five dimensions 1–10: communicationClarity, politeness, businessKnowledge, problemHandling, listeningAbility
+  agentScoresJson Json
+
+  /// [{ "topic": string, "asked": boolean }]
+  questionnaireJson Json
+
+  /// string[] per-call keywords
+  keywordsJson Json
+
+  /// string[]
+  actionItemsJson Json
+
+  positiveObservationsJson Json
+  negativeObservationsJson Json
+
+  /// Optional raw model payload for audit/debug
+  rawModelJson Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([sentiment])
+}
